@@ -19,25 +19,9 @@ EMEAC_MAX_DEN = 15.0
 API_URL = "https://meteobahia.com.ar/scripts/forecast/for-np.xml"
 PRON_DIAS_API = 8  # usar solo los primeros 8 días (API y Excel)
 
-# ================== Horizonte móvil acotado ==================
-
-# Ventana permitida para análisis (fijo)
-VENTANA_MIN = pd.Timestamp("2025-09-01")
-VENTANA_MAX = pd.Timestamp("2026-01-01")  # inclusive
-
-# Fecha actual
-HOY = pd.Timestamp.now().normalize()
-
-# Horizonte móvil: hoy → hoy + 7 días (8 días en total)
-rango_movil_inicio = HOY
-rango_movil_fin = HOY + pd.Timedelta(days=7)
-
-# Acotar a la ventana permitida
-fecha_inicio = max(rango_movil_inicio, VENTANA_MIN)
-fecha_fin    = min(rango_movil_fin,    VENTANA_MAX)
-
-# Mostrar al usuario
-st.caption(f"Horizonte de análisis: {fecha_inicio.date()} → {fecha_fin.date()} (máx. 8 días dentro de la ventana permitida)")
+# ======= Fechas (incluir hasta 31 de enero) =======
+fecha_inicio = pd.to_datetime("2025-09-01")
+fecha_fin    = pd.to_datetime("2026-01-31")
 
 # ================== Modelo ANN (pesos embebidos) ==================
 class PracticalANNModel:
@@ -195,14 +179,14 @@ def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
     fig_er.add_bar(x=pred["Fecha"],y=pred["EMERREL(0-1)"],marker=dict(color=colores),customdata=pred["Nivel_Emergencia_relativa"],
                    hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>")
     fig_er.add_scatter(x=pred["Fecha"],y=pred["EMERREL_MA5"],mode="lines",name="MA5")
-    fig.update_xaxes(range=["2025-09-01", "2026-01-01"], dtick="M1", tickformat="%b")
+    fig_er.update_xaxes(range=[fecha_inicio,fecha_fin],dtick="M1",tickformat="%b")
     st.plotly_chart(fig_er,use_container_width=True)
     st.subheader("EMERGENCIA ACUMULADA DIARIA")
     fig = go.Figure()
     fig.add_scatter(x=pred["Fecha"],y=pred["EMEAC (%) - máximo"],mode="lines",line=dict(width=0),name="EMEAC máx")
     fig.add_scatter(x=pred["Fecha"],y=pred["EMEAC (%) - mínimo"],mode="lines",line=dict(width=0),fill="tonexty",name="EMEAC mín")
     fig.add_scatter(x=pred["Fecha"],y=pred["EMEAC (%) - ajustable"],mode="lines",line=dict(width=2.5),name=f"Ajustable /{umbral_usuario:.2f}")
-    fig.update_yaxes(range=[0,100]); fig_er.update_xaxes(range=["2025-09-01", "2026-01-01"], dtick="M1", tickformat="%b")
+    fig.update_yaxes(range=[0,100]); fig.update_xaxes(range=[fecha_inicio,fecha_fin],dtick="M1",tickformat="%b")
     st.plotly_chart(fig,use_container_width=True)
     st.subheader(f"Resultados (sep → ene) - {nombre}")
     tabla = pred[["Fecha","Julian_days","Nivel_Emergencia_relativa"]].copy()
