@@ -68,7 +68,7 @@ class PracticalANNModel:
         self.input_min = np.array([1.0, 7.7, -3.5, 0.0], dtype=float)
         self.input_max = np.array([148.0, 38.5, 23.5, 59.9], dtype=float)
 
-    def tansig(self, x): 
+    def tansig(self, x):
         return np.tanh(x)
 
     def normalize_input(self, X_real):
@@ -134,7 +134,7 @@ def parse_meteobahia_xml(xml_bytes: bytes) -> pd.DataFrame:
         tmax = _to_float_attr(tmax_tag)
         tmin = _to_float_attr(tmin_tag)
         prec = _to_float_attr(precip_tag) or 0.0
-        rows.append({"Fecha": fecha.normalize(),"TMAX": tmax,"TMIN": tmin,"Prec": prec})
+        rows.append({"Fecha": fecha.normalize(), "TMAX": tmax, "TMIN": tmin, "Prec": prec})
     df = pd.DataFrame(rows).drop_duplicates("Fecha").sort_values("Fecha").reset_index(drop=True)
     for col in ["TMAX", "TMIN", "Prec"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").interpolate(limit_direction="both")
@@ -159,7 +159,7 @@ if fuente == "Subir Excel (.xlsx)":
     )
 
 @st.cache_resource
-def get_model(): 
+def get_model():
     return PracticalANNModel()
 modelo = get_model()
 
@@ -187,10 +187,10 @@ def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
                 .head(PRON_DIAS_API)
                 .reset_index(drop=True))
 
-    if df_win.empty: 
+    if df_win.empty:
         st.warning(f"{nombre}: no hay datos en {fecha_inicio.date()} → {fecha_fin.date()}")
         return
-    if len(df_win) < PRON_DIAS_API: 
+    if len(df_win) < PRON_DIAS_API:
         st.info(f"{nombre}: solo {len(df_win)} día(s) disponibles en esa ventana")
 
     X_real = df_win[["Julian_days","TMAX","TMIN","Prec"]].to_numpy(float)
@@ -209,12 +209,11 @@ def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
         pred[col.replace("(0-1)","(%)")] = (pred[col]*100).clip(0,100)
 
     # Forzar "Bajo" cuando EMEAC ajustable < 10%
-    mask_bajo = pred["EMEAC (%) - ajustable"] < 10.0
-    pred.loc[mask_bajo, "Nivel_Emergencia_relativa"] = "Bajo"
+    pred.loc[pred["EMEAC (%) - ajustable"] < 10.0, "Nivel_Emergencia_relativa"] = "Bajo"
 
     pred["EMERREL_MA5"] = pred["EMERREL(0-1)"].rolling(5, 1).mean()
 
-    # === Gráfico EMERGENCIA RELATIVA DIARIA ===
+    # === EMERGENCIA RELATIVA DIARIA ===
     st.subheader("EMERGENCIA RELATIVA DIARIA")
     colores = pred["Nivel_Emergencia_relativa"].map(COLOR_MAP).fillna(COLOR_FALLBACK).tolist()
 
@@ -227,34 +226,19 @@ def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
         hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>",
         name="EMERREL"
     )
-    fig_er.add_scatter(
-        x=pred["Fecha"],
-        y=pred["EMERREL_MA5"],
-        mode="lines",
-        name="MA5"
-    )
+    fig_er.add_scatter(x=pred["Fecha"], y=pred["EMERREL_MA5"], mode="lines", name="MA5")
     fig_er.update_xaxes(range=["2025-09-01", "2026-01-01"], dtick="M1", tickformat="%b")
     st.plotly_chart(fig_er, use_container_width=True)
 
-    # === Gráfico EMERGENCIA ACUMULADA DIARIA ===
+    # === EMERGENCIA ACUMULADA DIARIA ===
     st.subheader("EMERGENCIA ACUMULADA DIARIA")
-    fig = go.Figure()
-    # Primero "mínimo", luego "máximo" con fill='tonexty' para sombrear el rango.
-    fig.add_scatter(
-        x=pred["Fecha"], y=pred["EMEAC (%) - mínimo"],
-        mode="lines", line=dict(width=0), name="EMEAC mín"
-    )
-    fig.add_scatter(
-        x=pred["Fecha"], y=pred["EMEAC (%) - máximo"],
-        mode="lines", line=dict(width=0), fill="tonexty", name="EMEAC máx"
-    )
-    fig.add_scatter(
-        x=pred["Fecha"], y=pred["EMEAC (%) - ajustable"],
-        mode="lines", line=dict(width=2.5), name=f"Ajustable /{umbral_usuario:.2f}"
-    )
-    fig.update_yaxes(range=[0, 100])
-    fig.update_xaxes(range=["2025-09-01", "2026-01-01"], dtick="M1", tickformat="%b")
-    st.plotly_chart(fig, use_container_width=True)
+    fig_acc = go.Figure()
+    fig_acc.add_scatter(x=pred["Fecha"], y=pred["EMEAC (%) - mínimo"], mode="lines", line=dict(width=0), name="EMEAC mín")
+    fig_acc.add_scatter(x=pred["Fecha"], y=pred["EMEAC (%) - máximo"], mode="lines", line=dict(width=0), fill="tonexty", name="EMEAC máx")
+    fig_acc.add_scatter(x=pred["Fecha"], y=pred["EMEAC (%) - ajustable"], mode="lines", line=dict(width=2.5), name=f"Ajustable /{umbral_usuario:.2f}")
+    fig_acc.update_yaxes(range=[0, 100])
+    fig_acc.update_xaxes(range=["2025-09-01", "2026-01-01"], dtick="M1", tickformat="%b")
+    st.plotly_chart(fig_acc, use_container_width=True)
 
     # === Tabla ===
     st.subheader(f"Resultados (sep → ene) - {nombre}")
@@ -281,15 +265,18 @@ if fuente == "Subir Excel (.xlsx)":
     else:
         st.info("Sube al menos un archivo .xlsx para iniciar el análisis.")
 else:
+    # 1) Traer y parsear API (manejo de errores SOLO acá)
     try:
         xml_bytes = _fetch_xml(API_URL)
         df_api = parse_meteobahia_xml(xml_bytes)
+    except Exception as e:
+        st.error(f"No se pudo leer la API MeteoBahia: {e}")
+    else:
+        # 2) Recortar y mostrar resultados (errores de gráficos NO se confunden con la API)
         df_api = (df_api.sort_values("Fecha")
                         .drop_duplicates("Fecha")
                         .head(PRON_DIAS_API)
                         .reset_index(drop=True))
         st.success(f"API MeteoBahia: {df_api['Fecha'].min().date()} → {df_api['Fecha'].max().date()} · {len(df_api)} días (recortado a {PRON_DIAS_API})")
         procesar_y_mostrar(df_api, "MeteoBahia_API")
-    except Exception as e:
-        st.error(f"No se pudo leer la API MeteoBahia: {e}")
 
