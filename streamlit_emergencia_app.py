@@ -1,12 +1,45 @@
-
 import streamlit as st
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from pathlib import Path
+import plotly.graph_objects as go
+import xml.etree.ElementTree as ET
+from urllib.request import urlopen, Request
 
-# ------------------- Modelo ANN con pesos embebidos ---------------------
+# ================== Configuración visual y constantes ==================
+THR_BAJO_MEDIO = 0.02
+THR_MEDIO_ALTO = 0.079
+COLOR_MAP = {"Bajo": "#2ca02c", "Medio": "#ff7f0e", "Alto": "#d62728"}
+COLOR_FALLBACK = "#808080"
+
+# Denominadores de EMEAC (mín / máx de banda; ajustable = input usuario)
+EMEAC_MIN_DEN = 5.0
+EMEAC_MAX_DEN = 15.0
+
+API_URL = "https://meteobahia.com.ar/scripts/forecast/for-np.xml"
+PRON_DIAS_API = 8  # usar solo los primeros 8 días (API y Excel)
+
+# ================== Horizonte móvil acotado ==================
+
+# Ventana permitida para análisis (fijo)
+VENTANA_MIN = pd.Timestamp("2025-09-01")
+VENTANA_MAX = pd.Timestamp("2026-01-01")  # inclusive
+
+# Fecha actual
+HOY = pd.Timestamp.now().normalize()
+
+# Horizonte móvil: hoy → hoy + 7 días (8 días en total)
+rango_movil_inicio = HOY
+rango_movil_fin = HOY + pd.Timedelta(days=7)
+
+# Acotar a la ventana permitida
+fecha_inicio = max(rango_movil_inicio, VENTANA_MIN)
+fecha_fin    = min(rango_movil_fin,    VENTANA_MAX)
+
+# Mostrar al usuario
+st.caption(f"Horizonte de análisis: {fecha_inicio.date()} → {fecha_fin.date()} (máx. 8 días dentro de la ventana permitida)")
+
+# ================== Modelo ANN (pesos embebidos) ==================
 class PracticalANNModel:
     def __init__(self):
         self.IW = np.array([
@@ -18,55 +51,28 @@ class PracticalANNModel:
              1.901176, -6.076520, 0.239450, -6.862627, -7.592373, 1.422826, -2.575074, 5.302610, -6.379549, -14.810670],
             [10.220671, 2.665316, 4.119266, 5.812964, -3.848171, 1.472373, -4.829068, -7.422444, 0.862384, 0.001028,
              0.853059, 2.953289, 1.403689, -3.040909, -6.946802, -1.799923, 0.994357, -5.551789, -0.764891, 5.520776]
-        ])
-
+        ], dtype=float)
         self.bias_IW = np.array([
             7.229977, -2.428431, 2.973525, 1.956296, -1.155897, 0.907013, 0.231416, 5.258464, 3.284862, 5.474901,
             2.971978, 4.302273, 1.650572, -1.768043, -7.693806, -0.010850, 1.497102, -2.799158, -2.366918, -9.754413
-        ])
-
+        ], dtype=float)
         self.LW = np.array([
             5.508609, -21.909052, -10.648533, -2.939799, 8.192068, -2.157424, -3.373238, -5.932938, -2.680237,
             -3.399422, 5.870659, -1.720078, 7.134293, 3.227154, -5.039080, -10.872101, -6.569051, -8.455429,
             2.703778, 4.776029
-        ])
-
+        ], dtype=float)
         self.bias_out = -5.394722
-        self.input_min = np.array([1, 7.7, -3.5, 0])
-        self.input_max = np.array([148, 38.5, 23.5, 59.9])
+        self.input_min = np.array([1.0, 7.7, -3.5, 0.0], dtype=float)
+        self.input_max = np.array([148.0, 38.5, 23.5, 59.9], dtype=float)
 
-    def tansig(self, x):
-        return np.tanh(x)
+    def tansig(self, x): return np.tanh(x)
 
     def normalize_input(self, X_real):
-        return 2 * (X_real - self.input_min) / (self.input_max - self.input_min) - 1
+        Xc = np.clip(X_real, self.input_min, self.input_max)
+        return 2 * (Xc - self.input_min) / (self.input_max - self.input_min) - 1
 
-    def desnormalize_output(self, y_norm, ymin=-1, ymax=1):
+    def desnormalize_output(self, y_norm, ymin=-1.0, ymax=1.0):
         return (y_norm - ymin) / (ymax - ymin)
-
-    def predict(self, X_real):
-        X_norm = self.normalize_input(X_real)
-        emerrel_pred = np.array([self._predict_single(x) for x in X_norm])
-        emerrel_desnorm = self.desnormalize_output(emerrel_pred)
-        emerrel_cumsum = np.cumsum(emerrel_desnorm)
-        valor_max_emeac = 8.05
-        emer_ac = emerrel_cumsum / valor_max_emeac
-        emerrel_diff = np.diff(emer_ac, prepend=0)
-
-        def clasificar(valor):
-            if valor < 0.02:
-                return "Bajo"
-            elif valor <= 0.079:
-                return "Medio"
-            else:
-                return "Alto"
-
-        riesgo = np.array([clasificar(v) for v in emerrel_diff])
-
-        return pd.DataFrame({
-            "EMERREL(0-1)": emerrel_diff,
-            "Nivel_Emergencia_relativa": riesgo
-        })
 
     def _predict_single(self, x_norm):
         z1 = self.IW.T @ x_norm + self.bias_IW
@@ -74,117 +80,151 @@ class PracticalANNModel:
         z2 = self.LW @ a1 + self.bias_out
         return self.tansig(z2)
 
-# ------------------ Interfaz Streamlit ------------------
-st.title("Predicción de Emergencia Agrícola con ANN")
+    def predict(self, X_real):
+        X_norm = self.normalize_input(X_real.astype(float))
+        emerrel_pred = np.array([self._predict_single(x) for x in X_norm], dtype=float)
+        emerrel_desnorm = self.desnormalize_output(emerrel_pred)
+        emerrel_cumsum = np.cumsum(emerrel_desnorm)
+        valor_max_emeac = 8.05
+        emer_ac = emerrel_cumsum / valor_max_emeac
+        emerrel_diff = np.diff(emer_ac, prepend=0.0)
 
-st.info(
-    "**Formato requerido del archivo Excel:**\n"
-    "- Columnas: `Julian_days`, `TMAX`, `TMIN`, `Prec`\n"
-    "- El día 1 debe corresponder al **1 de septiembre de 2025**.\n"
-    "- Asegúrate de que los nombres de las columnas estén escritos exactamente igual."
-)
+        def clasificar(v):
+            if v < THR_BAJO_MEDIO:
+                return "Bajo"
+            elif v <= THR_MEDIO_ALTO:
+                return "Medio"
+            else:
+                return "Alto"
 
+        riesgo = np.array([clasificar(v) for v in emerrel_diff], dtype=object)
+        return pd.DataFrame({"EMERREL(0-1)": emerrel_diff, "Nivel_Emergencia_relativa": riesgo})
+
+# ================== Helpers API MeteoBahia ==================
+@st.cache_data(ttl=15*60, show_spinner=False)
+def _fetch_xml(url: str) -> bytes:
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Streamlit MeteoBahia)"})
+    with urlopen(req, timeout=20) as r:
+        return r.read()
+
+@st.cache_data(ttl=15*60, show_spinner=False)
+def parse_meteobahia_xml(xml_bytes: bytes) -> pd.DataFrame:
+    root = ET.fromstring(xml_bytes)
+    rows = []
+    for day in root.findall(".//day"):
+        fecha_tag  = day.find("fecha")
+        tmax_tag   = day.find("tmax")
+        tmin_tag   = day.find("tmin")
+        precip_tag = day.find("precip")
+        if fecha_tag is None or "value" not in (fecha_tag.attrib or {}):
+            continue
+        fecha_str = str(fecha_tag.attrib.get("value", "")).strip()
+        fecha = pd.to_datetime(fecha_str, errors="coerce")
+        if pd.isna(fecha):
+            continue
+        def _to_float_attr(tag):
+            if tag is None: return None
+            s = str(tag.attrib.get("value", "")).strip().replace(",", ".")
+            try: return float(s)
+            except: return None
+        tmax = _to_float_attr(tmax_tag)
+        tmin = _to_float_attr(tmin_tag)
+        prec = _to_float_attr(precip_tag) or 0.0
+        rows.append({"Fecha": fecha.normalize(),"TMAX": tmax,"TMIN": tmin,"Prec": prec})
+    df = pd.DataFrame(rows).drop_duplicates("Fecha").sort_values("Fecha").reset_index(drop=True)
+    for col in ["TMAX", "TMIN", "Prec"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").interpolate(limit_direction="both")
+    df["Prec"] = df["Prec"].fillna(0).clip(lower=0)
+    base = pd.Timestamp("2025-09-01")
+    df["Julian_days"] = (df["Fecha"] - base).dt.days + 1
+    return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
+
+# ================== App ==================
+st.set_page_config(page_title="Predicción de Emergencia Agrícola EUPHO - NAPOSTA 2025", layout="wide")
+st.title("Predicción de Emergencia Agrícola EUPHO - NAPOSTA 2025")
 
 st.sidebar.header("Configuración")
-umbral_usuario = st.sidebar.number_input(
-    "Umbral de EMEAC para 100%",
-    min_value=0.5,
-    max_value=2.84,
-    value=1.75,
-    step=0.01,
-    format="%.2f"
-)
+umbral_usuario = st.sidebar.number_input("Umbral ajustable de EMEAC para 100%",5.0,15.0,14.0,0.01,format="%.2f")
+fuente = st.sidebar.radio("Fuente de datos meteorológicos",["Subir Excel (.xlsx)","API MeteoBahia"],index=1)
 
-uploaded_files = st.file_uploader(
-    "Sube uno o más archivos Excel (.xlsx) con columnas: Julian_days, TMAX, TMIN, Prec",
-    type=["xlsx"],
-    accept_multiple_files=True
-)
+uploaded_files = None
+if fuente == "Subir Excel (.xlsx)":
+    uploaded_files = st.file_uploader("Sube uno o más .xlsx con columnas: Julian_days, TMAX, TMIN, Prec (Fecha opcional)",type=["xlsx"],accept_multiple_files=True)
 
-modelo = PracticalANNModel()
+@st.cache_resource
+def get_model(): return PracticalANNModel()
+modelo = get_model()
 
-def obtener_colores(niveles):
-    return niveles.map({"Bajo": "green", "Medio": "orange", "Alto": "red"})
+def _clasificar_local(v: float) -> str:
+    if v < THR_BAJO_MEDIO: return "Bajo"
+    elif v <= THR_MEDIO_ALTO: return "Medio"
+    else: return "Alto"
 
-legend_labels = [
-    plt.Line2D([0], [0], color='green', lw=4, label='Bajo'),
-    plt.Line2D([0], [0], color='orange', lw=4, label='Medio'),
-    plt.Line2D([0], [0], color='red', lw=4, label='Alto')
-]
+def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
+    req = {"Julian_days","TMAX","TMIN","Prec"}
+    if not req.issubset(df.columns):
+        st.warning(f"{nombre}: faltan columnas {req-set(df.columns)}"); return
+    if "Fecha" not in df.columns:
+        base = pd.Timestamp("2025-09-01")
+        jd = pd.to_numeric(df["Julian_days"], errors="coerce")
+        df["Fecha"] = (base + pd.to_timedelta(jd - 1, unit="D")).dt.normalize()
+    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+    m_win = (df["Fecha"]>=fecha_inicio)&(df["Fecha"]<=fecha_fin)
+    df_win = df.loc[m_win].sort_values("Fecha").drop_duplicates("Fecha").head(PRON_DIAS_API).reset_index(drop=True)
+    if df_win.empty: 
+        st.warning(f"{nombre}: no hay datos en {fecha_inicio.date()} → {fecha_fin.date()}"); return
+    if len(df_win)<PRON_DIAS_API: 
+        st.info(f"{nombre}: solo {len(df_win)} día(s) disponibles en esa ventana")
+    X_real = df_win[["Julian_days","TMAX","TMIN","Prec"]].to_numpy(float)
+    fechas = df_win["Fecha"]
+    pred = modelo.predict(X_real)
+    pred["Fecha"] = fechas; pred["Julian_days"] = df_win["Julian_days"].to_numpy()
+    pred["EMERREL acumulado"] = pred["EMERREL(0-1)"].cumsum()
+    pred["EMEAC (0-1) - mínimo"]    = pred["EMERREL acumulado"]/EMEAC_MIN_DEN
+    pred["EMEAC (0-1) - máximo"]    = pred["EMERREL acumulado"]/EMEAC_MAX_DEN
+    pred["EMEAC (0-1) - ajustable"] = pred["EMERREL acumulado"]/umbral_usuario
+    for col in ["EMEAC (0-1) - mínimo","EMEAC (0-1) - máximo","EMEAC (0-1) - ajustable"]:
+        pred[col.replace("(0-1)","(%)")] = (pred[col]*100).clip(0,100)
+    mask_bajo = pred["EMEAC (%) - ajustable"]<10.0
+    pred.loc[mask_bajo,"Nivel_Emergencia_relativa"]="Bajo"
+    pred["EMERREL_MA5"] = pred["EMERREL(0-1)"].rolling(5,1).mean()
+    # === Gráficos y tabla ===
+    st.subheader("EMERGENCIA RELATIVA DIARIA")
+    colores = pred["Nivel_Emergencia_relativa"].map(COLOR_MAP).fillna(COLOR_FALLBACK).tolist()
+    fig_er = go.Figure()
+    fig_er.add_bar(x=pred["Fecha"],y=pred["EMERREL(0-1)"],marker=dict(color=colores),customdata=pred["Nivel_Emergencia_relativa"],
+                   hovertemplate="Fecha: %{x|%d-%b-%Y}<br>EMERREL: %{y:.3f}<br>Nivel: %{customdata}<extra></extra>")
+    fig_er.add_scatter(x=pred["Fecha"],y=pred["EMERREL_MA5"],mode="lines",name="MA5")
+    fig.update_xaxes(range=["2025-09-01", "2026-01-01"], dtick="M1", tickformat="%b")
+    st.plotly_chart(fig_er,use_container_width=True)
+    st.subheader("EMERGENCIA ACUMULADA DIARIA")
+    fig = go.Figure()
+    fig.add_scatter(x=pred["Fecha"],y=pred["EMEAC (%) - máximo"],mode="lines",line=dict(width=0),name="EMEAC máx")
+    fig.add_scatter(x=pred["Fecha"],y=pred["EMEAC (%) - mínimo"],mode="lines",line=dict(width=0),fill="tonexty",name="EMEAC mín")
+    fig.add_scatter(x=pred["Fecha"],y=pred["EMEAC (%) - ajustable"],mode="lines",line=dict(width=2.5),name=f"Ajustable /{umbral_usuario:.2f}")
+    fig.update_yaxes(range=[0,100]); fig_er.update_xaxes(range=["2025-09-01", "2026-01-01"], dtick="M1", tickformat="%b")
+    st.plotly_chart(fig,use_container_width=True)
+    st.subheader(f"Resultados (sep → ene) - {nombre}")
+    tabla = pred[["Fecha","Julian_days","Nivel_Emergencia_relativa"]].copy()
+    tabla["EMEAC (%)"] = pred["EMEAC (%) - ajustable"]
+    iconos={"Bajo":"🟢 Bajo","Medio":"🟠 Medio","Alto":"🔴 Alto"}
+    tabla["Nivel_Emergencia_relativa"]=tabla["Nivel_Emergencia_relativa"].map(iconos)
+    tabla=tabla.rename(columns={"Nivel_Emergencia_relativa":"Nivel de EMERREL"})
+    st.dataframe(tabla,use_container_width=True)
+    st.download_button("Descargar CSV",tabla.to_csv(index=False).encode("utf-8"),f"{nombre}_resultados.csv","text/csv")
 
-# NUEVO rango de fechas
-fecha_inicio = pd.to_datetime("2025-09-01")
-fecha_fin = pd.to_datetime("2026-03-01")
-
-if uploaded_files:
-    for file in uploaded_files:
-        df = pd.read_excel(file)
-        if not all(col in df.columns for col in ["Julian_days", "TMAX", "TMIN", "Prec"]):
-            st.warning(f"{file.name} no tiene las columnas requeridas.")
-            continue
-
-        X_real = df[["Julian_days", "TMAX", "TMIN", "Prec"]].to_numpy()
-        fechas = pd.to_datetime("2025-09-01") + pd.to_timedelta(df["Julian_days"] - 1, unit="D")
-
-        pred = modelo.predict(X_real)
-        pred["Fecha"] = fechas
-        pred["Julian_days"] = df["Julian_days"]
-        pred["EMERREL acumulado"] = pred["EMERREL(0-1)"].cumsum()
-        pred["EMEAC (0-1)"] = pred["EMERREL acumulado"] / umbral_usuario
-        pred["EMEAC (%)"] = pred["EMEAC (0-1)"] * 100
-
-        nombre = Path(file.name).stem
-        colores = obtener_colores(pred["Nivel_Emergencia_relativa"])
-
-        st.subheader(f"EMERREL (0-1) - {nombre}")
-        # Calcular media móvil de 5 días
-        pred["EMERREL_MA5"] = pred["EMERREL(0-1)"].rolling(window=5, min_periods=1).mean()
-        fig_er, ax_er = plt.subplots(figsize=(14, 5), dpi=150)
-        ax_er.bar(pred["Fecha"], pred["EMERREL(0-1)"], color=colores, label="EMERREL (0-1)")
-        ax_er.plot(pred["Fecha"], pred["EMERREL_MA5"], color="blue", linewidth=2.2, label="Media móvil 5 días")
-        ax_er.set_title(f"Emergencia Relativa Diaria - {nombre}")
-        ax_er.set_xlabel("Fecha")
-        ax_er.set_ylabel("EMERREL (0-1)")
-        ax_er.grid(True, linestyle="--", alpha=0.5)
-        ax_er.set_xlim(fecha_inicio, fecha_fin)
-        ax_er.legend(handles=legend_labels + [plt.Line2D([0], [0], color="blue", lw=2, label="Media móvil 5 días")], title="Niveles")
-        ax_er.xaxis.set_major_locator(mdates.MonthLocator())
-        ax_er.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
-        plt.setp(ax_er.xaxis.get_majorticklabels(), rotation=0)
-        st.pyplot(fig_er)
-
-        st.subheader(f"EMEAC (%) - {nombre}")
-        fechas_validas = pd.to_datetime(pred["Fecha"])
-        emeac_pct = pd.to_numeric(pred["EMEAC (%)"], errors="coerce")
-        validez = ~(fechas_validas.isna() | emeac_pct.isna())
-        fechas_plot = fechas_validas[validez].to_numpy()
-        emeac_plot = emeac_pct[validez].to_numpy()
-
-        fig_eac, ax_eac = plt.subplots(figsize=(14, 5), dpi=150)
-        ax_eac.fill_between(fechas_plot, emeac_plot, color="skyblue", alpha=0.5)
-        ax_eac.plot(fechas_plot, emeac_plot, color="blue", linewidth=2)
-
-        niveles = [25, 50, 75, 90]
-        colores_niveles = ['gray', 'green', 'orange', 'red']
-        for nivel, color in zip(niveles, colores_niveles):
-            ax_eac.axhline(nivel, linestyle='--', color=color, linewidth=1.5, label=f'{nivel}%')
-
-        ax_eac.set_title(f"Progreso EMEAC (%) - {nombre} (Umbral: {umbral_usuario})")
-        ax_eac.set_xlabel("Fecha")
-        ax_eac.set_ylabel("EMEAC (%)")
-        ax_eac.set_ylim(0, 100)
-        ax_eac.set_xlim(fecha_inicio, fecha_fin)
-        ax_eac.grid(True, linestyle="--", alpha=0.5)
-        ax_eac.xaxis.set_major_locator(mdates.MonthLocator())
-        ax_eac.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
-        ax_eac.legend(title="Niveles EMEAC (%)")
-        plt.setp(ax_eac.xaxis.get_majorticklabels(), rotation=0)
-        st.pyplot(fig_eac)
-
-        st.subheader(f"Datos calculados - {nombre}")
-        tabla_filtrada = pred[["Fecha", "Nivel_Emergencia_relativa", "EMEAC (%)"]]
-        st.dataframe(tabla_filtrada)
-        csv = tabla_filtrada.to_csv(index=False).encode("utf-8")
-        st.download_button(f"Descargar CSV - {nombre}", csv, f"{nombre}_EMEAC.csv", "text/csv")
+# ================ Flujo principal ================
+if fuente=="Subir Excel (.xlsx)":
+    if uploaded_files:
+        for file in uploaded_files:
+            df=pd.read_excel(file)
+            procesar_y_mostrar(df,Path(file.name).stem)
+    else: st.info("Sube al menos un archivo .xlsx para iniciar el análisis.")
 else:
-    st.info("Sube al menos un archivo .xlsx para iniciar el análisis.")
+    try:
+        xml_bytes=_fetch_xml(API_URL)
+        df_api=parse_meteobahia_xml(xml_bytes)
+        df_api=(df_api.sort_values("Fecha").drop_duplicates("Fecha").head(PRON_DIAS_API).reset_index(drop=True))
+        st.success(f"API MeteoBahia: {df_api['Fecha'].min().date()} → {df_api['Fecha'].max().date()} · {len(df_api)} días (recortado a {PRON_DIAS_API})")
+        procesar_y_mostrar(df_api,"MeteoBahia_API")
+    except Exception as e: st.error(f"No se pudo leer la API MeteoBahia: {e}")
