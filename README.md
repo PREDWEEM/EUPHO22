@@ -1,2 +1,2 @@
-# EUPHO22
-EUPHO22
+# EUPHO
+euphorbia davidii
