@@ -7,7 +7,43 @@ import xml.etree.ElementTree as ET
 from urllib.request import urlopen, Request
 
 # ================== Config de página (PRIMER st.*) ==================
-st.set_page_config(page_title="Predicción de Emergencia Agrícola EUPHO - NAPOSTA 2025", layout="wide")
+st.set_page_config(page_title="Predicción de Emergencia Agrícola EUPHO - BAHIA BLANCA 2025", layout="wide")
+
+# ================== UX: detectar modo embebido y herramientas de recarga ==================
+def _get_query_params():
+    # Compatibilidad: Streamlit moderno (st.query_params) y versiones previas
+    try:
+        qp = st.query_params  # disponible en >=1.29 aprox.
+        if isinstance(qp, dict):
+            return {k: [v] if isinstance(v, str) else v for k, v in qp.items()}
+        return dict(qp)
+    except Exception:
+        try:
+            return st.experimental_get_query_params()
+        except Exception:
+            return {}
+
+def is_embedded() -> bool:
+    qp = _get_query_params()
+    val = str(qp.get("embed", [""])[0]).lower()
+    return val in {"1", "true", "yes"}
+
+def app_base_url() -> str:
+    # URL directa de tu app (sin parámetros)
+    return "https://appemergenciapy-lscuxqt2j3sa9yjrwgyqnh.streamlit.app/"
+
+if is_embedded():
+    st.info("Esta app está embebida. Si no arranca o quedó dormida, ábrela en una pestaña nueva o reintenta la carga.")
+    colA, colB = st.columns(2)
+    with colA:
+        st.link_button("🔗 Abrir app completa", app_base_url())
+    with colB:
+        if st.button("🔁 Reintentar (limpiar caché y recargar)"):
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.rerun()
 
 # ================== Configuración visual y constantes ==================
 THR_BAJO_MEDIO = 0.02
@@ -19,11 +55,10 @@ COLOR_FALLBACK = "#808080"
 EMEAC_MIN_DEN = 5.0
 EMEAC_MAX_DEN = 15.0
 
-API_URL = "https://meteobahia.com.ar/scripts/forecast/for-np.xml"
+API_URL = "https://meteobahia.com.ar/scripts/forecast/for-bb.xml"
 PRON_DIAS_API = 8  # usar solo los primeros 8 días (API y Excel)
 
 # ================== Horizonte móvil acotado ==================
-
 # Ventana permitida para análisis (fijo)
 VENTANA_MIN = pd.Timestamp("2025-09-01")
 VENTANA_MAX = pd.Timestamp("2026-01-01")  # inclusive
@@ -111,6 +146,17 @@ def _fetch_xml(url: str) -> bytes:
     with urlopen(req, timeout=20) as r:
         return r.read()
 
+def fetch_xml_with_feedback(url: str, retries: int = 2) -> bytes:
+    last_err = None
+    with st.spinner("Conectando a MeteoBahia..."):
+        for _ in range(retries):
+            try:
+                return _fetch_xml(url)
+            except Exception as e:
+                last_err = e
+    # Si falla, dejamos que el try/except superior lo capture
+    raise last_err if last_err else RuntimeError("Error desconocido al leer la API")
+
 @st.cache_data(ttl=15*60, show_spinner=False)
 def parse_meteobahia_xml(xml_bytes: bytes) -> pd.DataFrame:
     root = ET.fromstring(xml_bytes)
@@ -144,11 +190,20 @@ def parse_meteobahia_xml(xml_bytes: bytes) -> pd.DataFrame:
     return df[["Fecha","Julian_days","TMAX","TMIN","Prec"]]
 
 # ================== App ==================
-st.title("Predicción de Emergencia Agrícola EUPHO - NAPOSTA 2025")
+st.title("Predicción de Emergencia Agrícola EUPHO - BAHIA BLANCA 2025")
 
 st.sidebar.header("Configuración")
 umbral_usuario = st.sidebar.number_input("Umbral ajustable de EMEAC para 100%", 5.0, 15.0, 14.0, 0.01, format="%.2f")
 fuente = st.sidebar.radio("Fuente de datos meteorológicos", ["Subir Excel (.xlsx)", "API MeteoBahia"], index=1)
+
+# Botón global de refresco
+with st.sidebar:
+    if st.button("🔄 Refrescar pronóstico"):
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.rerun()
 
 uploaded_files = None
 if fuente == "Subir Excel (.xlsx)":
@@ -190,8 +245,8 @@ def procesar_y_mostrar(df: pd.DataFrame, nombre: str):
     if df_win.empty:
         st.warning(f"{nombre}: no hay datos en {fecha_inicio.date()} → {fecha_fin.date()}")
         return
-    if len(df_win) < PRON_DIAS_API:
-        st.info(f"{nombre}: solo {len(df_win)} día(s) disponibles en esa ventana")
+   # if len(df_win) < PRON_DIAS_API:
+   #  st.info(f"{nombre}: solo {len(df_win)} día(s) disponibles en esa ventana. Tip: si estás embebido, abre la app completa una vez para ‘despertarla’ y vuelve.")
 
     X_real = df_win[["Julian_days","TMAX","TMIN","Prec"]].to_numpy(float)
     fechas = df_win["Fecha"]
@@ -267,16 +322,19 @@ if fuente == "Subir Excel (.xlsx)":
 else:
     # 1) Traer y parsear API (manejo de errores SOLO acá)
     try:
-        xml_bytes = _fetch_xml(API_URL)
+        xml_bytes = fetch_xml_with_feedback(API_URL)
         df_api = parse_meteobahia_xml(xml_bytes)
     except Exception as e:
         st.error(f"No se pudo leer la API MeteoBahia: {e}")
     else:
-        # 2) Recortar y mostrar resultados (errores de gráficos NO se confunden con la API)
-        df_api = (df_api.sort_values("Fecha")
-                        .drop_duplicates("Fecha")
-                        .head(PRON_DIAS_API)
-                        .reset_index(drop=True))
-        st.success(f"API MeteoBahia: {df_api['Fecha'].min().date()} → {df_api['Fecha'].max().date()} · {len(df_api)} días (recortado a {PRON_DIAS_API})")
-        procesar_y_mostrar(df_api, "MeteoBahia_API")
-
+        # 2) Validar vacío antes de graficar
+        if df_api.empty:
+            st.error("La API no devolvió datos utilizables en la ventana seleccionada.")
+        else:
+            # 3) Recortar y mostrar resultados (errores de gráficos NO se confunden con la API)
+            df_api = (df_api.sort_values("Fecha")
+                            .drop_duplicates("Fecha")
+                            .head(PRON_DIAS_API)
+                            .reset_index(drop=True))
+            st.success(f"API MeteoBahia: {df_api['Fecha'].min().date()} → {df_api['Fecha'].max().date()} · {len(df_api)} días (recortado a {PRON_DIAS_API})")
+            procesar_y_mostrar(df_api, "MeteoBahia_API")
